@@ -20,4 +20,4 @@ RUN uv sync --no-dev --no-install-project
 COPY . .
 
 EXPOSE 8082
-CMD ["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+CMD ["uv", "run", "--no-sync", "uvicorn", "servidor:app", "--host", "0.0.0.0", "--port", "10000"]
