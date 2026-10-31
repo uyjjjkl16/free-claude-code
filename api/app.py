@@ -13,7 +13,7 @@ from config.settings import get_settings
 from providers.exceptions import ProviderError
 
 from .dependencies import cleanup_provider
-from .rotas import router
+from .routes import router
 
 # Opt-in to future behavior for python-telegram-bot
 os.environ["PTB_TIMEDELTA"] = "1"
