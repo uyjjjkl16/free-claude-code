@@ -1,4 +1,5 @@
-FROM python:3.14-slim
+FROM python:3.11-slim
+
 
 # Instalar Node.js e npm necessários para o Claude Code
 RUN apt-get update && apt-get install -y curl && \
