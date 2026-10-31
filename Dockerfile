@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-
 # Instalar Node.js e npm necessários para o Claude Code
 RUN apt-get update && apt-get install -y curl && \
     curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
@@ -16,7 +15,7 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 
 # Dependencies first, so code changes don't re-run pip install
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project
+RUN uv sync --no-dev --no-install-project
 
 COPY . .
 
