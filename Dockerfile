@@ -1,3 +1,4 @@
+
 FROM python:3.14-slim
 
 RUN apt-get update && apt-get install -y curl \
@@ -21,4 +22,4 @@ COPY . .
 
 EXPOSE 10000
 
-CMD ["uv", "run", "--no-sync", "uvicorn", "servidor:app", "--host", "0.0.0.0", "--port", "10000"]
+CMD ["uv", "run", "--no-sync", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "10000"]
