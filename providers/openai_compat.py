@@ -160,12 +160,17 @@ class OpenAICompatibleProvider(BaseProvider):
         request_id: str | None = None,
         raise_before_output: bool = False,
     ) -> AsyncIterator[str]:
-        """Stream response in Anthropic SSE format."""
-        with logger.contextualize(request_id=request_id):
-            async for event in self._stream_response_impl(
-                request, input_tokens, request_id, raise_before_output
-            ):
-                yield event
+        """Stream response in Anthropic SSE format.
+
+        No `logger.contextualize` here: its context token cannot be reset when
+        this generator is started in one task (the route handler reads the first
+        event) and finished in another (the streaming response). The log lines
+        that matter already carry request_id explicitly.
+        """
+        async for event in self._stream_response_impl(
+            request, input_tokens, request_id, raise_before_output
+        ):
+            yield event
 
     async def _stream_response_impl(
         self,
