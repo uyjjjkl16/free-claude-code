@@ -1,343 +1,413 @@
-"""FastAPI route handlers."""
+"""Shared base class for OpenAI-compatible providers (NIM, OpenRouter, LM Studio)."""
 
 import json
-import traceback
 import uuid
-from collections.abc import AsyncIterator
+from abc import abstractmethod
+from collections.abc import AsyncIterator, Iterator
+from typing import Any
 
-import anyio
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+import httpx
 from loguru import logger
-from starlette.types import Message, Send
+from openai import AsyncOpenAI, BadRequestError
 
-from config.settings import MODEL_ID_PREFIX, VALID_PROVIDERS, Settings
-from providers.common import get_user_facing_error_message
-from providers.exceptions import APIError, InvalidRequestError, ProviderError
-from providers.logging_utils import build_request_summary, log_request_compact
-
-from .dependencies import get_provider_for_type, get_settings, require_auth
-from .models.anthropic import MessagesRequest, TokenCountRequest
-from .models.responses import TokenCountResponse
-from .optimization_handlers import try_optimizations
-from .request_utils import get_token_count
-
-router = APIRouter()
-
-PING_MESSAGE: Message = {
-    "type": "http.response.body",
-    "body": b'event: ping\ndata: {"type": "ping"}\n\n',
-    "more_body": True,
-}
+from providers.base import BaseProvider, ProviderConfig
+from providers.common import (
+    ContentType,
+    HeuristicToolParser,
+    SSEBuilder,
+    ThinkTagParser,
+    append_request_id,
+    get_user_facing_error_message,
+    map_error,
+    map_stop_reason,
+)
+from providers.common.message_converter import has_images, strip_images
+from providers.common.utils import max_tokens_limit
+from providers.exceptions import APIError, RateLimitError
+from providers.rate_limit import ProviderRateLimiter
 
 
-class KeepAliveStreamingResponse(StreamingResponse):
-    """StreamingResponse that also sends an SSE ping every `ping_interval` seconds.
-
-    Claude Code aborts a stream after ~5 minutes without bytes, e.g. while a
-    request waits for a provider concurrency slot. The body is still iterated in
-    the response task, so client-disconnect cancellation works as before.
-    """
-
-    ping_interval = 15.0
-
-    async def stream_response(self, send: Send) -> None:
-        finished = False
-
-        async def tracking_send(message: Message) -> None:
-            nonlocal finished
-            if message["type"] == "http.response.body" and not message.get(
-                "more_body", False
-            ):
-                finished = True  # no pings after the final body message
-            await send(message)
-
-        async def ping() -> None:
-            while True:
-                await anyio.sleep(self.ping_interval)
-                if not finished:
-                    await send(PING_MESSAGE)
-
-        # shortcut: errors leave as an ExceptionGroup; Starlette unwraps them on ASGI
-        # spec 2.3 (uvicorn), but not on 2.4 servers. Unwrap here if we support one.
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(ping)
-            await super().stream_response(tracking_send)
-            tg.cancel_scope.cancel()
+async def _prepend_chunk(first: Any, rest: AsyncIterator[Any]) -> AsyncIterator[Any]:
+    """Yield an already-read first chunk, then the rest of the stream."""
+    yield first
+    async for chunk in rest:
+        yield chunk
 
 
-async def collect_message(events: AsyncIterator[str]) -> dict:
-    """Assemble streamed Anthropic SSE events into one Message (for stream=false)."""
-    message: dict = {}
-    blocks: dict[int, dict] = {}
-    tool_json: dict[int, list[str]] = {}
-    async for event in events:
-        name, _, data = event.strip().partition("\ndata: ")
-        payload = json.loads(data)
-        match name.removeprefix("event: "):
-            case "message_start":
-                message = payload["message"]
-            case "content_block_start":
-                blocks[payload["index"]] = payload["content_block"]
-            case "content_block_delta":
-                block, delta = blocks[payload["index"]], payload["delta"]
-                if delta["type"] == "input_json_delta":
-                    tool_json.setdefault(payload["index"], []).append(
-                        delta["partial_json"]
-                    )
-                for key in ("text", "thinking", "signature"):
-                    if key in delta:
-                        block[key] = block.get(key, "") + delta[key]
-            case "content_block_stop":
-                if payload["index"] in tool_json:
-                    raw = "".join(tool_json.pop(payload["index"]))
-                    blocks[payload["index"]]["input"] = json.loads(raw or "{}")
-            case "message_delta":
-                message.update(payload["delta"])
-                message.setdefault("usage", {}).update(payload.get("usage", {}))
-            case "error":
-                raise APIError(payload["error"]["message"])
-    message["content"] = [blocks[i] for i in sorted(blocks)]
-    return message
+class OpenAICompatibleProvider(BaseProvider):
+    """Base class for providers using OpenAI-compatible chat completions API."""
 
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        provider_name: str,
+        base_url: str,
+        api_key: str,
+        nim_settings: Any = None,
+    ):
+        super().__init__(config)
+        self._provider_name = provider_name
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
+        self._nim_settings = nim_settings
+        self._text_only_models: set[str] = set()
+        self._max_tokens_caps: dict[str, int] = {}
+        self._rate_limiter = ProviderRateLimiter(
+            rate_limit=config.rate_limit,
+            rate_window=config.rate_window,
+            max_concurrency=config.max_concurrency,
+        )
+        self._client = AsyncOpenAI(
+            api_key=self._api_key,
+            base_url=self._base_url,
+            max_retries=0,
+            timeout=httpx.Timeout(
+                config.http_read_timeout,
+                connect=config.http_connect_timeout,
+                read=config.http_read_timeout,
+                write=config.http_write_timeout,
+            ),
+        )
 
-async def stream_with_fallback(
-    request_data: MessagesRequest,
-    models: list[str],
-    first_events: AsyncIterator[str],
-    input_tokens: int,
-    request_id: str,
-    raise_on_last: bool = False,
-) -> AsyncIterator[str]:
-    """Relay `first_events`; if models[0] fails before any output, try the next model.
+    async def list_models(self) -> list[str]:
+        """Model IDs from the provider's OpenAI-compatible /models endpoint."""
+        return sorted([model.id async for model in self._client.models.list()])
 
-    Providers send nothing (not even message_start) until their first real chunk
-    arrives, so a failure before output is still free to fall back or to become a
-    proper HTTP error. If the last model fails before output and `raise_on_last`
-    is set, the error is raised; after output has started it is never raised
-    here (the provider reports it as an SSE error event instead).
-    """
-    sent_output = False
-    for i, model in enumerate(models):
-        is_last = i == len(models) - 1
-        try:
-            events = first_events
-            if i:
-                provider = get_provider_for_type(Settings.parse_provider_type(model))
-                request_data.model = Settings.parse_model_name(model)
-                events = provider.stream_response(
-                    request_data,
-                    input_tokens=input_tokens,
-                    request_id=request_id,
-                    raise_before_output=raise_on_last or not is_last,
+    async def cleanup(self) -> None:
+        """Release HTTP client resources."""
+        client = getattr(self, "_client", None)
+        if client is not None:
+            await client.close()
+
+    @abstractmethod
+    def _build_request_body(self, request: Any) -> dict:
+        """Build request body. Must be implemented by subclasses."""
+
+    def _handle_extra_reasoning(self, delta: Any, sse: SSEBuilder) -> Iterator[str]:
+        """Hook for provider-specific reasoning (e.g. OpenRouter reasoning_details)."""
+        return iter(())
+
+    def _process_tool_call(self, tc: dict, sse: SSEBuilder) -> Iterator[str]:
+        """Process a single tool call delta and yield SSE events."""
+        tc_index = tc.get("index", 0)
+        if tc_index < 0:
+            tc_index = len(sse.blocks.tool_states)
+
+        fn_delta = tc.get("function") or {}
+        incoming_name = fn_delta.get("name")
+        if incoming_name is not None or tc_index not in sse.blocks.tool_states:
+            sse.blocks.register_tool_name(tc_index, incoming_name or "")
+        state = sse.blocks.tool_states[tc_index]
+        if tc.get("id") and not state.started:
+            state.tool_id = tc["id"]
+
+        args = fn_delta.get("arguments")
+        if args:
+            if not state.started:
+                yield sse.start_tool_block(
+                    tc_index,
+                    state.tool_id or f"tool_{uuid.uuid4()}",
+                    state.name or "tool_call",
                 )
-            async for event in events:
-                sent_output = True
+
+            current_name = state.name
+            if current_name == "Task":
+                parsed = sse.blocks.buffer_task_args(tc_index, args)
+                if parsed is not None:
+                    yield sse.emit_tool_delta(tc_index, json.dumps(parsed))
+                return
+
+            yield sse.emit_tool_delta(tc_index, args)
+
+    async def _open_stream(self, body: dict, tag: str) -> Any:
+        """Start the stream, retrying 400s we can fix: output limit, then images."""
+        while True:
+            try:
+                return await self._rate_limiter.execute_with_retry(
+                    self._client.chat.completions.create, **body, stream=True
+                )
+            except BadRequestError as e:
+                fixed = self._fix_bad_request(body, str(e), tag)
+                if fixed is None:
+                    raise
+                body = fixed
+
+    def _fix_bad_request(self, body: dict, error: str, tag: str) -> dict | None:
+        """A smaller request the provider should accept, remembered per model, or None."""
+        model = body.get("model", "")
+        limit = max_tokens_limit(error, body.get("max_tokens"))
+        if limit:
+            logger.warning("{}: {} allows max_tokens={}, retrying", tag, model, limit)
+            self._max_tokens_caps[model] = limit
+            return {**body, "max_tokens": limit}
+        if has_images(body):
+            logger.warning("{}: {} rejected images, retrying without", tag, model)
+            self._text_only_models.add(model)
+            return strip_images(body)
+        return None
+
+    def _flush_task_arg_buffers(self, sse: SSEBuilder) -> Iterator[str]:
+        """Emit buffered Task args as a single JSON delta (best-effort)."""
+        for tool_index, out in sse.blocks.flush_task_arg_buffers():
+            yield sse.emit_tool_delta(tool_index, out)
+
+    async def stream_response(
+        self,
+        request: Any,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        raise_before_output: bool = False,
+    ) -> AsyncIterator[str]:
+        """Stream response in Anthropic SSE format."""
+        with logger.contextualize(request_id=request_id):
+            async for event in self._stream_response_impl(
+                request, input_tokens, request_id, raise_before_output
+            ):
                 yield event
-            return
-        except Exception as e:
-            if is_last or sent_output:
-                raise
-            logger.warning(
-                "MODEL_FALLBACK: {} failed before output ({}), trying {}",
-                model,
-                get_user_facing_error_message(e),
-                models[i + 1],
+
+    async def _stream_response_impl(
+        self,
+        request: Any,
+        input_tokens: int,
+        request_id: str | None,
+        raise_before_output: bool = False,
+    ) -> AsyncIterator[str]:
+        """Shared streaming implementation.
+
+        Nothing is yielded (not even message_start) until the provider has
+        delivered its first real chunk. If the provider fails before that, the
+        error is raised (when raise_before_output is set) so the API layer can
+        answer with a proper HTTP error instead of an empty HTTP 200.
+        """
+        tag = self._provider_name
+        message_id = f"msg_{uuid.uuid4()}"
+        sse = SSEBuilder(message_id, request.model, input_tokens)
+
+        body = self._build_request_body(request)
+        model = body.get("model", "")
+        if model in self._text_only_models:
+            body = strip_images(body)
+        cap = self._max_tokens_caps.get(model)
+        if cap and body.get("max_tokens", 0) > cap:
+            body["max_tokens"] = cap
+        req_tag = f" request_id={request_id}" if request_id else ""
+        logger.info(
+            "{}_STREAM:{} model={} msgs={} tools={}",
+            tag,
+            req_tag,
+            body.get("model"),
+            len(body.get("messages", [])),
+            len(body.get("tools", [])),
+        )
+
+        think_parser = ThinkTagParser()
+        heuristic_parser = HeuristicToolParser()
+
+        finish_reason = None
+        text_tool_calls = 0
+        usage_info = None
+        started = False  # True once message_start has been sent to the client
+
+        async with self._rate_limiter.concurrency_slot():
+            try:
+                stream = await self._open_stream(body, tag)
+                chunks = aiter(stream)
+
+                # Wait for the first real chunk BEFORE starting the response.
+                try:
+                    first_chunk = await anext(chunks)
+                except StopAsyncIteration:
+                    raise APIError(
+                        f"{tag} returned an empty stream (no data from the model)"
+                    ) from None
+                logger.debug("{}_STREAM:{} first chunk received", tag, req_tag)
+
+                yield sse.message_start()
+                started = True
+
+                async for chunk in _prepend_chunk(first_chunk, chunks):
+                    if getattr(chunk, "usage", None):
+                        usage_info = chunk.usage
+
+                    if not chunk.choices:
+                        continue
+
+                    choice = chunk.choices[0]
+                    if choice.finish_reason:
+                        finish_reason = choice.finish_reason
+                        logger.debug("{} finish_reason: {}", tag, finish_reason)
+
+                    delta = choice.delta
+                    if delta is None:
+                        continue
+
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if reasoning:
+                        for event in sse.ensure_thinking_block():
+                            yield event
+                        yield sse.emit_thinking_delta(reasoning)
+
+                    for event in self._handle_extra_reasoning(delta, sse):
+                        yield event
+
+                    if delta.content:
+                        for part in think_parser.feed(delta.content):
+                            if part.type == ContentType.THINKING:
+                                for event in sse.ensure_thinking_block():
+                                    yield event
+                                yield sse.emit_thinking_delta(part.content)
+                            else:
+                                filtered_text, detected_tools = heuristic_parser.feed(
+                                    part.content
+                                )
+
+                                if filtered_text:
+                                    for event in sse.ensure_text_block():
+                                        yield event
+                                    yield sse.emit_text_delta(filtered_text)
+
+                                for tool_use in detected_tools:
+                                    text_tool_calls += 1
+                                    for event in sse.close_content_blocks():
+                                        yield event
+
+                                    block_idx = sse.blocks.allocate_index()
+                                    if tool_use.get("name") == "Task" and isinstance(
+                                        tool_use.get("input"), dict
+                                    ):
+                                        tool_use["input"]["run_in_background"] = False
+                                    yield sse.content_block_start(
+                                        block_idx,
+                                        "tool_use",
+                                        id=tool_use["id"],
+                                        name=tool_use["name"],
+                                    )
+                                    yield sse.content_block_delta(
+                                        block_idx,
+                                        "input_json_delta",
+                                        json.dumps(tool_use["input"]),
+                                    )
+                                    yield sse.content_block_stop(block_idx)
+
+                    if delta.tool_calls:
+                        for event in sse.close_content_blocks():
+                            yield event
+                        for tc in delta.tool_calls:
+                            fn = tc.function
+                            tc_info = {
+                                "index": tc.index,
+                                "id": tc.id,
+                                "function": {
+                                    "name": fn.name if fn else None,
+                                    "arguments": fn.arguments if fn else None,
+                                },
+                            }
+                            for event in self._process_tool_call(tc_info, sse):
+                                yield event
+
+            except Exception as e:
+                logger.error("{}_ERROR:{} {}: {}", tag, req_tag, type(e).__name__, e)
+                mapped_e = map_error(e)
+                if isinstance(mapped_e, RateLimitError):
+                    self._rate_limiter.set_blocked(60)
+                if raise_before_output and not started:
+                    raise mapped_e from e
+                error_message = append_request_id(
+                    get_user_facing_error_message(
+                        mapped_e, read_timeout_s=self._config.http_read_timeout
+                    ),
+                    request_id,
+                )
+                logger.info(
+                    "{}_STREAM: Emitting SSE error event for {}{}",
+                    tag,
+                    type(e).__name__,
+                    req_tag,
+                )
+                if not started:
+                    # Callers that don't use raise_before_output still get a
+                    # well-formed stream: message_start, then the error event.
+                    yield sse.message_start()
+                    started = True
+                yield sse.error_event(
+                    getattr(mapped_e, "error_type", "api_error"), error_message
+                )
+                return
+
+        remaining = think_parser.flush()
+        if remaining:
+            if remaining.type == ContentType.THINKING:
+                for event in sse.ensure_thinking_block():
+                    yield event
+                yield sse.emit_thinking_delta(remaining.content)
+            else:
+                for event in sse.ensure_text_block():
+                    yield event
+                yield sse.emit_text_delta(remaining.content)
+
+        for tool_use in heuristic_parser.flush():
+            text_tool_calls += 1
+            for event in sse.close_content_blocks():
+                yield event
+
+            block_idx = sse.blocks.allocate_index()
+            yield sse.content_block_start(
+                block_idx,
+                "tool_use",
+                id=tool_use["id"],
+                name=tool_use["name"],
             )
+            if tool_use.get("name") == "Task" and isinstance(
+                tool_use.get("input"), dict
+            ):
+                tool_use["input"]["run_in_background"] = False
+            yield sse.content_block_delta(
+                block_idx,
+                "input_json_delta",
+                json.dumps(tool_use["input"]),
+            )
+            yield sse.content_block_stop(block_idx)
 
+        if sse.blocks.text_index == -1 and not sse.blocks.tool_states:
+            for event in sse.ensure_text_block():
+                yield event
+            yield sse.emit_text_delta(" ")
 
-async def replay_events(
-    first_event: str, rest: AsyncIterator[str]
-) -> AsyncIterator[str]:
-    """Yield an already-read first event, then the rest; close `rest` when done."""
-    try:
-        yield first_event
-        async for event in rest:
+        for index, state in list(sse.blocks.tool_states.items()):
+            if not state.started and state.name:
+                yield sse.start_tool_block(
+                    index, state.tool_id or f"tool_{uuid.uuid4()}", state.name
+                )
+
+        for event in self._flush_task_arg_buffers(sse):
             yield event
-    finally:
-        aclose = getattr(rest, "aclose", None)
-        if aclose is not None:
-            await aclose()
 
+        for event in sse.close_all_blocks():
+            yield event
 
-# =============================================================================
-# Routes
-# =============================================================================
-@router.post("/v1/messages")
-async def create_message(
-    request_data: MessagesRequest,
-    raw_request: Request,
-    settings: Settings = Depends(get_settings),
-    model_override: str | None = Depends(require_auth),
-):
-    """Create a message (always streaming)."""
+        # Ensure output_tokens is always a valid integer.
+        raw_output_tokens = getattr(usage_info, "completion_tokens", None)
 
-    try:
-        if model_override:
-            request_data.resolved_provider_model = model_override
-            request_data.model = Settings.parse_model_name(model_override)
+        if isinstance(raw_output_tokens, int) and not isinstance(raw_output_tokens, bool):
+            output_tokens = max(raw_output_tokens, 0)
+        else:
+            output_tokens = sse.estimate_output_tokens()
 
-        if not request_data.messages:
-            raise InvalidRequestError("messages cannot be empty")
+        if usage_info and hasattr(usage_info, "prompt_tokens"):
+            provider_input = usage_info.prompt_tokens
+            if isinstance(provider_input, int):
+                logger.debug(
+                    "TOKEN_ESTIMATE: our={} provider={} diff={:+d}",
+                    input_tokens,
+                    provider_input,
+                    provider_input - input_tokens,
+                )
 
-        optimized = try_optimizations(request_data, settings)
-        if optimized is not None:
-            return optimized
+        stop_reason = map_stop_reason(finish_reason)
+        if stop_reason == "end_turn" and (text_tool_calls or sse.blocks.tool_states):
+            stop_reason = "tool_use"
 
-        # Resolve the provider of the first model now, so misconfiguration is a 503.
-        models = (request_data.resolved_provider_model or settings.model).split(",")
-        provider = get_provider_for_type(Settings.parse_provider_type(models[0]))
-
-        request_id = f"req_{uuid.uuid4().hex[:12]}"
-        log_request_compact(logger, request_id, request_data)
-
-        input_tokens = get_token_count(
-            request_data.messages, request_data.system, request_data.tools
-        )
-        streaming = request_data.stream is not False
-        first_events = provider.stream_response(
-            request_data,
-            input_tokens=input_tokens,
-            request_id=request_id,
-            # An error before the provider's first chunk becomes a real HTTP error.
-            raise_before_output=True,
-        )
-        events = stream_with_fallback(
-            request_data,
-            models,
-            first_events,
-            input_tokens,
-            request_id,
-            raise_on_last=True,
-        )
-        if not streaming:
-            return JSONResponse(await collect_message(events))
-
-        # Streaming: wait for the first real event BEFORE answering HTTP 200.
-        # If the provider fails before that, the exception propagates from here
-        # and the client receives a proper HTTP error instead of an empty 200.
-        try:
-            first_event = await anext(events)
-        except StopAsyncIteration:
-            raise APIError("The provider returned no data for this request") from None
-
-        return KeepAliveStreamingResponse(
-            replay_events(first_event, events),
-            media_type="text/event-stream",
-            headers={
-                "X-Accel-Buffering": "no",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        )
-
-    except ProviderError:
-        raise
-    except Exception as e:
-        logger.error(f"Error: {e!s}\n{traceback.format_exc()}")
-        raise HTTPException(
-            status_code=getattr(e, "status_code", 500),
-            detail=get_user_facing_error_message(e),
-        ) from e
-
-
-@router.post("/v1/messages/count_tokens", dependencies=[Depends(require_auth)])
-async def count_tokens(request_data: TokenCountRequest):
-    """Count tokens for a request."""
-    request_id = f"req_{uuid.uuid4().hex[:12]}"
-    with logger.contextualize(request_id=request_id):
-        try:
-            tokens = get_token_count(
-                request_data.messages, request_data.system, request_data.tools
-            )
-            summary = build_request_summary(request_data)
-            summary["request_id"] = request_id
-            summary["input_tokens"] = tokens
-            logger.info("COUNT_TOKENS: {}", json.dumps(summary))
-            return TokenCountResponse(input_tokens=tokens)
-        except Exception as e:
-            logger.error(
-                "COUNT_TOKENS_ERROR: request_id={} error={}\n{}",
-                request_id,
-                get_user_facing_error_message(e),
-                traceback.format_exc(),
-            )
-            raise HTTPException(
-                status_code=500, detail=get_user_facing_error_message(e)
-            ) from e
-
-
-@router.get("/")
-async def root(settings: Settings = Depends(get_settings)):
-    """Root endpoint."""
-    return {
-        "status": "ok",
-        "provider": settings.provider_type,
-        "model": settings.model,
-    }
-
-
-@router.get("/v1/models", dependencies=[Depends(require_auth)])
-async def list_models(
-    catalog: str | None = None, settings: Settings = Depends(get_settings)
-):
-    """Configured models, for Claude Code's /model picker (gateway model discovery).
-
-    With ?catalog=<provider>, every model that provider offers (used by claude-pick).
-    """
-    if catalog is None:
-        models = {
-            m: ", ".join(uses) for m, uses in settings.configured_models().items()
-        }
-    else:
-        if catalog not in VALID_PROVIDERS:
-            raise HTTPException(400, f"Unknown provider {catalog!r}")
-        provider = get_provider_for_type(catalog)  # 503 if its key is missing
-        try:
-            ids = await provider.list_models()
-        except Exception as e:
-            raise HTTPException(
-                502,
-                f"Could not list {catalog} models: {get_user_facing_error_message(e)}",
-            ) from e
-        models = {f"{catalog}/{model_id}": catalog for model_id in ids}
-    data = [
-        {
-            "type": "model",
-            "id": f"{MODEL_ID_PREFIX}{model}",
-            "display_name": model,
-            "description": description,
-            "created_at": "1970-01-01T00:00:00Z",
-        }
-        for model, description in models.items()
-    ]
-    return {
-        "data": data,
-        "has_more": False,
-        "first_id": data[0]["id"] if data else None,
-        "last_id": data[-1]["id"] if data else None,
-    }
-
-
-@router.get("/health")
-async def health():
-    """Health check endpoint."""
-    return {"status": "healthy"}
-
-
-@router.post("/stop", dependencies=[Depends(require_auth)])
-async def stop_cli(request: Request):
-    """Stop all CLI sessions and pending tasks."""
-    handler = getattr(request.app.state, "message_handler", None)
-    if not handler:
-        # Fallback if messaging not initialized
-        cli_manager = getattr(request.app.state, "cli_manager", None)
-        if cli_manager:
-            await cli_manager.stop_all()
-            logger.info("STOP_CLI: source=cli_manager cancelled_count=N/A")
-            return {"status": "stopped", "source": "cli_manager"}
-        raise HTTPException(status_code=503, detail="Messaging system not initialized")
-
-    count = await handler.stop_all_tasks()
-    logger.info("STOP_CLI: source=handler cancelled_count={}", count)
-    return {"status": "stopped", "cancelled_count": count}
+        yield sse.message_delta(stop_reason, output_tokens)
+        yield sse.message_stop()
