@@ -1,6 +1,7 @@
 """Shared base class for OpenAI-compatible providers (NIM, OpenRouter, LM Studio)."""
 
 import json
+import re
 import uuid
 from abc import abstractmethod
 from collections.abc import AsyncIterator, Iterator
@@ -53,6 +54,7 @@ class OpenAICompatibleProvider(BaseProvider):
         self._nim_settings = nim_settings
         self._text_only_models: set[str] = set()
         self._max_tokens_caps: dict[str, int] = {}
+        self._unsupported_params: dict[str, set[str]] = {}
         self._rate_limiter = ProviderRateLimiter(
             rate_limit=config.rate_limit,
             rate_window=config.rate_window,
@@ -141,11 +143,47 @@ class OpenAICompatibleProvider(BaseProvider):
             logger.warning("{}: {} allows max_tokens={}, retrying", tag, model, limit)
             self._max_tokens_caps[model] = limit
             return {**body, "max_tokens": limit}
+        names = self._unsupported_param_names(error)
+        if names:
+            stripped = self._strip_params(body, names)
+            if stripped != body:
+                logger.warning(
+                    "{}: {} rejected params {}, retrying without",
+                    tag,
+                    model,
+                    sorted(names),
+                )
+                self._unsupported_params.setdefault(model, set()).update(names)
+                return stripped
         if has_images(body):
             logger.warning("{}: {} rejected images, retrying without", tag, model)
             self._text_only_models.add(model)
             return strip_images(body)
         return None
+
+    @staticmethod
+    def _unsupported_param_names(error: str) -> set[str]:
+        """Parameter names from a provider error like
+        "Unsupported parameter(s): `a`, `b`" (empty set if not that error)."""
+        match = re.search(r"Unsupported parameter\(s\):([^'\"}]*)", error)
+        if not match:
+            return set()
+        return set(re.findall(r"`([^`]+)`", match.group(1)))
+
+    @classmethod
+    def _strip_params(cls, body: dict, names: set[str]) -> dict:
+        """Copy of body without the named parameters (top level and extra_body)."""
+
+        def drop(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {k: drop(v) for k, v in value.items() if k not in names}
+            return value
+
+        stripped = {k: v for k, v in body.items() if k not in names}
+        extra = stripped.get("extra_body")
+        if isinstance(extra, dict):
+            stripped["extra_body"] = drop(extra)
+        return stripped
 
     def _flush_task_arg_buffers(self, sse: SSEBuilder) -> Iterator[str]:
         """Emit buffered Task args as a single JSON delta (best-effort)."""
@@ -197,6 +235,9 @@ class OpenAICompatibleProvider(BaseProvider):
         cap = self._max_tokens_caps.get(model)
         if cap and body.get("max_tokens", 0) > cap:
             body["max_tokens"] = cap
+        dropped = self._unsupported_params.get(model)
+        if dropped:
+            body = self._strip_params(body, dropped)
         req_tag = f" request_id={request_id}" if request_id else ""
         logger.info(
             "{}_STREAM:{} model={} msgs={} tools={}",
