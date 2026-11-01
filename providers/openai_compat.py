@@ -1,3 +1,4 @@
+
 """Shared base class for OpenAI-compatible providers (NIM, OpenRouter, LM Studio)."""
 
 import json
@@ -44,7 +45,6 @@ class OpenAICompatibleProvider(BaseProvider):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._nim_settings = nim_settings
-        # Learned from 400s: models without image input, and their max output tokens.
         self._text_only_models: set[str] = set()
         self._max_tokens_caps: dict[str, int] = {}
         self._rate_limiter = ProviderRateLimiter(
@@ -96,8 +96,6 @@ class OpenAICompatibleProvider(BaseProvider):
         if tc.get("id") and not state.started:
             state.tool_id = tc["id"]
 
-        # Start the block on the first arguments: by then the name, which some
-        # providers send after the id or in fragments, is complete.
         args = fn_delta.get("arguments")
         if args:
             if not state.started:
@@ -127,7 +125,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 fixed = self._fix_bad_request(body, str(e), tag)
                 if fixed is None:
                     raise
-                body = fixed  # each fix strictly shrinks the request, so this ends
+                body = fixed
 
     def _fix_bad_request(self, body: dict, error: str, tag: str) -> dict | None:
         """A smaller request the provider should accept, remembered per model, or None."""
@@ -212,7 +210,6 @@ class OpenAICompatibleProvider(BaseProvider):
                         continue
 
                     choice = chunk.choices[0]
-                    # Read before the delta check: some providers end with delta=None.
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
                         logger.debug("{} finish_reason: {}", tag, finish_reason)
@@ -221,18 +218,15 @@ class OpenAICompatibleProvider(BaseProvider):
                     if delta is None:
                         continue
 
-                    # Handle reasoning_content (OpenAI extended format)
                     reasoning = getattr(delta, "reasoning_content", None)
                     if reasoning:
                         for event in sse.ensure_thinking_block():
                             yield event
                         yield sse.emit_thinking_delta(reasoning)
 
-                    # Provider-specific extra reasoning (e.g. OpenRouter reasoning_details)
                     for event in self._handle_extra_reasoning(delta, sse):
                         yield event
 
-                    # Handle text content
                     if delta.content:
                         for part in think_parser.feed(delta.content):
                             if part.type == ContentType.THINKING:
@@ -272,12 +266,11 @@ class OpenAICompatibleProvider(BaseProvider):
                                     )
                                     yield sse.content_block_stop(block_idx)
 
-                    # Handle native tool calls
                     if delta.tool_calls:
                         for event in sse.close_content_blocks():
                             yield event
                         for tc in delta.tool_calls:
-                            fn = tc.function  # None on id-only deltas
+                            fn = tc.function
                             tc_info = {
                                 "index": tc.index,
                                 "id": tc.id,
@@ -293,7 +286,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 logger.error("{}_ERROR:{} {}: {}", tag, req_tag, type(e).__name__, e)
                 mapped_e = map_error(e)
                 if isinstance(mapped_e, RateLimitError):
-                    self._rate_limiter.set_blocked(60)  # cool down this provider only
+                    self._rate_limiter.set_blocked(60)
                 if raise_before_output and sse.blocks.next_index == 0:
                     raise mapped_e from e
                 error_message = append_request_id(
@@ -308,14 +301,11 @@ class OpenAICompatibleProvider(BaseProvider):
                     type(e).__name__,
                     req_tag,
                 )
-                # Open blocks stay open: Claude Code keeps only completed blocks, so a
-                # half-streamed tool call is never run with cut-off arguments.
                 yield sse.error_event(
                     getattr(mapped_e, "error_type", "api_error"), error_message
                 )
                 return
 
-        # Flush remaining content
         remaining = think_parser.flush()
         if remaining:
             if remaining.type == ContentType.THINKING:
@@ -355,7 +345,6 @@ class OpenAICompatibleProvider(BaseProvider):
                 yield event
             yield sse.emit_text_delta(" ")
 
-        # Tools that never received arguments still need their block.
         for index, state in list(sse.blocks.tool_states.items()):
             if not state.started and state.name:
                 yield sse.start_tool_block(
@@ -368,11 +357,14 @@ class OpenAICompatibleProvider(BaseProvider):
         for event in sse.close_all_blocks():
             yield event
 
-        output_tokens = (
-            usage_info.completion_tokens
-            if usage_info and hasattr(usage_info, "completion_tokens")
-            else sse.estimate_output_tokens()
-        )
+        # Ensure output_tokens is always a valid integer.
+        raw_output_tokens = getattr(usage_info, "completion_tokens", None)
+
+        if isinstance(raw_output_tokens, int) and not isinstance(raw_output_tokens, bool):
+            output_tokens = max(raw_output_tokens, 0)
+        else:
+            output_tokens = sse.estimate_output_tokens()
+
         if usage_info and hasattr(usage_info, "prompt_tokens"):
             provider_input = usage_info.prompt_tokens
             if isinstance(provider_input, int):
@@ -382,9 +374,10 @@ class OpenAICompatibleProvider(BaseProvider):
                     provider_input,
                     provider_input - input_tokens,
                 )
+
         stop_reason = map_stop_reason(finish_reason)
-        # Text-parsed tool calls, and some providers' native ones, end with "stop".
         if stop_reason == "end_turn" and (text_tool_calls or sse.blocks.tool_states):
             stop_reason = "tool_use"
+
         yield sse.message_delta(stop_reason, output_tokens)
         yield sse.message_stop()
