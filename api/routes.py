@@ -109,10 +109,15 @@ async def stream_with_fallback(
     request_id: str,
     raise_on_last: bool = False,
 ) -> AsyncIterator[str]:
-    """Relay `first_events`; if models[0] fails before any content, try the next model.
+    """Relay `first_events`; if models[0] fails before any output, try the next model.
 
-    The last model streams its error to the client as usual.
+    Providers send nothing (not even message_start) until their first real chunk
+    arrives, so a failure before output is still free to fall back or to become a
+    proper HTTP error. If the last model fails before output and `raise_on_last`
+    is set, the error is raised; after output has started it is never raised
+    here (the provider reports it as an SSE error event instead).
     """
+    sent_output = False
     for i, model in enumerate(models):
         is_last = i == len(models) - 1
         try:
@@ -127,13 +132,11 @@ async def stream_with_fallback(
                     raise_before_output=raise_on_last or not is_last,
                 )
             async for event in events:
-                # The client already got message_start from the first attempt.
-                if i and event.startswith("event: message_start"):
-                    continue
+                sent_output = True
                 yield event
             return
         except Exception as e:
-            if is_last:
+            if is_last or sent_output:
                 raise
             logger.warning(
                 "MODEL_FALLBACK: {} failed before output ({}), trying {}",
@@ -141,6 +144,20 @@ async def stream_with_fallback(
                 get_user_facing_error_message(e),
                 models[i + 1],
             )
+
+
+async def replay_events(
+    first_event: str, rest: AsyncIterator[str]
+) -> AsyncIterator[str]:
+    """Yield an already-read first event, then the rest; close `rest` when done."""
+    try:
+        yield first_event
+        async for event in rest:
+            yield event
+    finally:
+        aclose = getattr(rest, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 # =============================================================================
@@ -182,23 +199,30 @@ async def create_message(
             request_data,
             input_tokens=input_tokens,
             request_id=request_id,
-            # Non-streaming: an error before output becomes a real HTTP error status.
-            raise_before_output=len(models) > 1 or not streaming,
+            # An error before the provider's first chunk becomes a real HTTP error.
+            raise_before_output=True,
+        )
+        events = stream_with_fallback(
+            request_data,
+            models,
+            first_events,
+            input_tokens,
+            request_id,
+            raise_on_last=True,
         )
         if not streaming:
-            events = stream_with_fallback(
-                request_data,
-                models,
-                first_events,
-                input_tokens,
-                request_id,
-                raise_on_last=True,
-            )
             return JSONResponse(await collect_message(events))
+
+        # Streaming: wait for the first real event BEFORE answering HTTP 200.
+        # If the provider fails before that, the exception propagates from here
+        # and the client receives a proper HTTP error instead of an empty 200.
+        try:
+            first_event = await anext(events)
+        except StopAsyncIteration:
+            raise APIError("The provider returned no data for this request") from None
+
         return KeepAliveStreamingResponse(
-            stream_with_fallback(
-                request_data, models, first_events, input_tokens, request_id
-            ),
+            replay_events(first_event, events),
             media_type="text/event-stream",
             headers={
                 "X-Accel-Buffering": "no",
